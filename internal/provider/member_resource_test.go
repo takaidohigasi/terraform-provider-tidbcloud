@@ -63,6 +63,9 @@ type memberStore struct {
 	// create-succeeded-but-read-failed path.
 	failList    bool
 	deleteCalls int
+	// unfilteredLists counts ListMembers calls without an email filter, which
+	// only memberListCache makes.
+	unfilteredLists int
 }
 
 func (m *memberStore) toUser() tidbcloud.OpenApiUser {
@@ -100,9 +103,12 @@ func newMemberMock(t *testing.T) (*mockClient.MockTiDBCloudIAMClient, *memberSto
 		}).AnyTimes()
 
 	s.EXPECT().ListMembers(gomock.Any(), gomock.Any()).DoAndReturn(
-		func(_ context.Context, _ *tidbcloud.ListMembersParams) (*tidbcloud.OpenApiListUsersRsp, error) {
+		func(_ context.Context, p *tidbcloud.ListMembersParams) (*tidbcloud.OpenApiListUsersRsp, error) {
 			if store.failList {
 				return nil, errors.New("transient list error")
+			}
+			if p == nil || p.Email == nil {
+				store.unfilteredLists++
 			}
 			if store.deleted {
 				return &tidbcloud.OpenApiListUsersRsp{}, nil
@@ -162,6 +168,11 @@ func TestUTMemberResource(t *testing.T) {
 			// Delete is performed automatically by the test framework.
 		},
 	})
+	// Only Read lists the members without an email filter; the reads right
+	// after create and update filter by email.
+	if store.unfilteredLists == 0 {
+		t.Error("Read did not look the member up through memberListCache")
+	}
 }
 
 // TestUTMemberResourceCreateKeepsStateOnReadFailure reproduces the
