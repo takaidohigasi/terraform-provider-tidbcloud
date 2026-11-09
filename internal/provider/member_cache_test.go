@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/golang/mock/gomock"
 	mockClient "github.com/tidbcloud/terraform-provider-tidbcloud/mock"
@@ -103,5 +104,67 @@ func TestMemberListCache_DoesNotCacheErrors(t *testing.T) {
 	}
 	if member == nil || *member.UserId != "user-a" {
 		t.Errorf("member = %v, want user-a", member)
+	}
+}
+
+// blockingListMembers makes ListMembers block until release is closed and then
+// return err. started is closed when the first call begins.
+func blockingListMembers(s *mockClient.MockTiDBCloudIAMClient, err error) (started, release chan struct{}) {
+	started, release = make(chan struct{}), make(chan struct{})
+	s.EXPECT().ListMembers(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, _ *tidbcloud.ListMembersParams) (*tidbcloud.OpenApiListUsersRsp, error) {
+			close(started)
+			<-release
+			return nil, err
+		}).Times(1)
+	return started, release
+}
+
+func TestMemberListCache_SharesFailedListingWithWaiters(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	s := mockClient.NewMockTiDBCloudIAMClient(ctrl)
+	listErr := errors.New("429 Too Many Requests")
+	started, release := blockingListMembers(s, listErr)
+
+	cache := &memberListCache{}
+	const lookups = 5
+	errs := make(chan error, lookups)
+	go func() {
+		_, err := cache.find(context.Background(), s, "a@example.com")
+		errs <- err
+	}()
+	<-started
+	for i := 1; i < lookups; i++ {
+		go func() {
+			_, err := cache.find(context.Background(), s, "a@example.com")
+			errs <- err
+		}()
+	}
+	// Give the waiters time to join the listing; one that came after it would
+	// call ListMembers a second time and fail Times(1).
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+
+	for i := 0; i < lookups; i++ {
+		if err := <-errs; !errors.Is(err, listErr) {
+			t.Errorf("err = %v, want %v", err, listErr)
+		}
+	}
+}
+
+func TestMemberListCache_WaiterReturnsOnContextDone(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	s := mockClient.NewMockTiDBCloudIAMClient(ctrl)
+	started, release := blockingListMembers(s, errors.New("unused"))
+	defer close(release)
+
+	cache := &memberListCache{}
+	go func() { _, _ = cache.find(context.Background(), s, "a@example.com") }()
+	<-started
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := cache.find(ctx, s, "a@example.com"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
 	}
 }

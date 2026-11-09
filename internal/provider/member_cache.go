@@ -18,25 +18,60 @@ import (
 // as the refresh of that command. Writes to members call invalidate so that a
 // later lookup lists the members again.
 type memberListCache struct {
-	mu      sync.Mutex
-	loaded  bool
+	mu       sync.Mutex
+	loaded   bool
+	members  []tidbcloud.OpenApiUser
+	inflight *memberListing
+}
+
+// memberListing is one listing in progress. The lookups that arrive while it
+// runs wait for it and share its result, an error included.
+type memberListing struct {
+	done    chan struct{}
 	members []tidbcloud.OpenApiUser
+	err     error
 }
 
 // list returns all members of the organization, listing them on the first
-// call. A failed listing is not cached, so the next call tries again.
+// call. Concurrent calls share one listing, and the mutex is not held while it
+// runs, so a waiting call still returns when its context is done. A failed
+// listing is returned to the calls that waited for it but is not cached, so a
+// later call tries again; without sharing it, each waiting call would retry
+// the failed listing in turn.
 func (c *memberListCache) list(ctx context.Context, client tidbcloud.TiDBCloudIAMClient) ([]tidbcloud.OpenApiUser, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.loaded {
-		return c.members, nil
+		members := c.members
+		c.mu.Unlock()
+		return members, nil
 	}
-	members, err := listAllMembers(ctx, client)
-	if err != nil {
-		return nil, err
+	if l := c.inflight; l != nil {
+		c.mu.Unlock()
+		select {
+		case <-l.done:
+			return l.members, l.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
-	c.members, c.loaded = members, true
-	return members, nil
+	l := &memberListing{done: make(chan struct{})}
+	c.inflight = l
+	c.mu.Unlock()
+
+	l.members, l.err = listAllMembers(ctx, client)
+
+	c.mu.Lock()
+	// After an invalidate, the listing may predate a write, so it is only
+	// returned to the calls that waited for it.
+	if c.inflight == l {
+		c.inflight = nil
+		if l.err == nil {
+			c.members, c.loaded = l.members, true
+		}
+	}
+	c.mu.Unlock()
+	close(l.done)
+	return l.members, l.err
 }
 
 // find returns the member with the given email from the cached list, or nil if
@@ -58,7 +93,7 @@ func (c *memberListCache) find(ctx context.Context, client tidbcloud.TiDBCloudIA
 func (c *memberListCache) invalidate() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.loaded, c.members = false, nil
+	c.loaded, c.members, c.inflight = false, nil, nil
 }
 
 func listAllMembers(ctx context.Context, client tidbcloud.TiDBCloudIAMClient) ([]tidbcloud.OpenApiUser, error) {
