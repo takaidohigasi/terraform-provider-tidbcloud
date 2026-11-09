@@ -39,6 +39,10 @@ type tidbcloudProvider struct {
 
 	IAMClient tidbcloud.TiDBCloudIAMClient
 
+	// memberCache serves the member lookups of this Terraform command from one
+	// listing of the organization members.
+	memberCache *memberListCache
+
 	// configured is set to true at the end of the Configure method.
 	// This can be used in Resource and DataSource implementations to verify
 	// that the provider was previously configured.
@@ -153,6 +157,7 @@ func (p *tidbcloudProvider) Configure(ctx context.Context, req provider.Configur
 	p.DedicatedClient = dc
 	p.ServerlessClient = sc
 	p.IAMClient = ic
+	p.memberCache = &memberListCache{}
 	p.configured = true
 	resp.ResourceData = p
 	resp.DataSourceData = p

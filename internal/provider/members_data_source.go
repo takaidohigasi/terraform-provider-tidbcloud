@@ -8,8 +8,6 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
-	"github.com/juju/errors"
-	"github.com/tidbcloud/terraform-provider-tidbcloud/tidbcloud"
 )
 
 type membersDataSourceData struct {
@@ -113,7 +111,7 @@ func (d *membersDataSource) Read(ctx context.Context, req datasource.ReadRequest
 	}
 
 	tflog.Trace(ctx, "read members data source")
-	members, err := d.retrieveMembers(ctx)
+	members, err := d.provider.memberCache.list(ctx, d.provider.IAMClient)
 	if err != nil {
 		resp.Diagnostics.AddError("Read Error", fmt.Sprintf("Unable to call ListMembers, got error: %s", err))
 		return
@@ -142,27 +140,4 @@ func (d *membersDataSource) Read(ctx context.Context, req datasource.ReadRequest
 
 	diags = resp.State.Set(ctx, &data)
 	resp.Diagnostics.Append(diags...)
-}
-
-func (d *membersDataSource) retrieveMembers(ctx context.Context) ([]tidbcloud.OpenApiUser, error) {
-	var items []tidbcloud.OpenApiUser
-
-	pageSize := int32(DefaultPageSize)
-	var pageToken *string
-	for {
-		rsp, err := d.provider.IAMClient.ListMembers(ctx, &tidbcloud.ListMembersParams{
-			PageSize:  &pageSize,
-			PageToken: pageToken,
-		})
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		items = append(items, rsp.Users...)
-
-		pageToken = rsp.NextPageToken
-		if IsNilOrEmpty(pageToken) {
-			break
-		}
-	}
-	return items, nil
 }

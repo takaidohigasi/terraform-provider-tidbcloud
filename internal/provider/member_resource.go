@@ -165,6 +165,7 @@ func (r memberResource) Create(ctx context.Context, req resource.CreateRequest, 
 		return
 	}
 	invitedUserID := userIDFromInviteResult(inviteRsp, data.Email.ValueString())
+	r.provider.memberCache.invalidate()
 
 	// The invitation now exists remotely, so it must be tracked from this
 	// point on: persist the returned identity and the planned configuration
@@ -219,7 +220,7 @@ func (r memberResource) Read(ctx context.Context, req resource.ReadRequest, resp
 	}
 
 	tflog.Trace(ctx, "read member_resource")
-	member, err := r.readMemberByEmail(ctx, data.Email.ValueString())
+	member, err := r.provider.memberCache.find(ctx, r.provider.IAMClient, data.Email.ValueString())
 	if err != nil {
 		resp.Diagnostics.AddError("Read Error", fmt.Sprintf("Unable to call ListMembers, got error: %s", err))
 		return
@@ -261,6 +262,7 @@ func (r memberResource) Update(ctx context.Context, req resource.UpdateRequest, 
 		resp.Diagnostics.AddError("Update Error", fmt.Sprintf("Unable to call UpdateMember, got error: %s", err))
 		return
 	}
+	r.provider.memberCache.invalidate()
 
 	member, err := r.readMemberByEmail(ctx, state.Email.ValueString())
 	if err != nil {
@@ -286,6 +288,7 @@ func (r memberResource) Delete(ctx context.Context, req resource.DeleteRequest, 
 
 	tflog.Trace(ctx, "delete member_resource")
 	err := r.provider.IAMClient.DeleteMember(ctx, userId)
+	r.provider.memberCache.invalidate()
 	// Treat an already-removed member as a successful delete so destroy is
 	// idempotent if the member was removed out of band.
 	if err != nil && !tidbcloud.IsNotFoundError(err) {
@@ -307,7 +310,8 @@ func (r memberResource) ImportState(ctx context.Context, req resource.ImportStat
 }
 
 // readMemberByEmail lists members filtered by email and returns the exact match,
-// or nil if no member with that email exists.
+// or nil if no member with that email exists. It bypasses memberCache so that a
+// read right after a write sees the result of the write; Read uses the cache.
 func (r memberResource) readMemberByEmail(ctx context.Context, email string) (*tidbcloud.OpenApiUser, error) {
 	return findMemberByEmail(ctx, r.provider.IAMClient, email)
 }
@@ -341,7 +345,7 @@ func (r memberResource) readMemberByEmailWithRetry(ctx context.Context, email st
 	return nil, nil
 }
 
-// findMemberByEmail is shared by the resource and the single member data source.
+// findMemberByEmail lists the members filtered by email, without memberCache.
 func findMemberByEmail(ctx context.Context, client tidbcloud.TiDBCloudIAMClient, email string) (*tidbcloud.OpenApiUser, error) {
 	pageSize := int32(DefaultPageSize)
 	var pageToken *string

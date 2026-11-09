@@ -118,7 +118,7 @@ func (d *memberDataSource) Read(ctx context.Context, req datasource.ReadRequest,
 	}
 
 	tflog.Trace(ctx, "read member data source")
-	member, err := findMemberByEmail(ctx, d.provider.IAMClient, data.Email.ValueString())
+	member, err := d.provider.memberCache.find(ctx, d.provider.IAMClient, data.Email.ValueString())
 	if err != nil {
 		resp.Diagnostics.AddError("Read Error", fmt.Sprintf("Unable to call ListMembers, got error: %s", err))
 		return
