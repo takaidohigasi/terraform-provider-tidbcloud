@@ -502,25 +502,45 @@ func (r *dedicatedChangefeedResource) Schema(_ context.Context, _ resource.Schem
 					},
 				},
 			},
+			// The computed attributes below keep their refreshed value in an
+			// update plan, so that they do not show up as "(known after apply)"
+			// for every edit. Update keeps the planned values and the next
+			// refresh reads the live ones; only state is left unknown when the
+			// update changes paused.
 			"state": schema.StringAttribute{
-				MarkdownDescription: "The current state of the changefeed.",
+				MarkdownDescription: "The current state of the changefeed, as of the last refresh. An update that does not change `paused` keeps the refreshed value until the next refresh.",
 				Computed:            true,
+				PlanModifiers: []planmodifier.String{
+					changefeedStateUnlessPausedChanges{},
+				},
 			},
 			"create_time": schema.StringAttribute{
 				MarkdownDescription: "The creation time of the changefeed.",
 				Computed:            true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
 			},
 			"checkpoint_tso": schema.StringAttribute{
-				MarkdownDescription: "The checkpoint TSO of the changefeed.",
+				MarkdownDescription: "The checkpoint TSO of the changefeed, as of the last refresh.",
 				Computed:            true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
 			},
 			"checkpoint_ts": schema.StringAttribute{
-				MarkdownDescription: "The checkpoint timestamp of the changefeed.",
+				MarkdownDescription: "The checkpoint timestamp of the changefeed, as of the last refresh.",
 				Computed:            true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
 			},
 			"error": schema.StringAttribute{
-				MarkdownDescription: "The error message when the changefeed is in the `FAILED` or `ERROR` state.",
+				MarkdownDescription: "The error message when the changefeed is in the `FAILED` or `ERROR` state, as of the last refresh.",
 				Computed:            true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
 			},
 		},
 	}
@@ -827,7 +847,9 @@ func (r dedicatedChangefeedResource) Update(ctx context.Context, req resource.Up
 		resp.Diagnostics.AddError("Update Error", fmt.Sprintf("Unable to read changefeed after update, got error: %s", err))
 		return
 	}
+	planned := plan
 	refreshDedicatedChangefeedComputedFields(changefeed, &plan)
+	keepPlannedChangefeedComputedFields(&planned, &plan)
 	if plan.Paused.IsUnknown() || plan.Paused.IsNull() {
 		plan.Paused = types.BoolValue(desiredPaused)
 	}
@@ -976,6 +998,54 @@ func refreshDedicatedChangefeedComputedFields(changefeed *tidbcloud.Changefeed, 
 	data.CheckpointTso = types.StringPointerValue(changefeed.CheckpointTso)
 	data.CheckpointTs = types.StringPointerValue(changefeed.CheckpointTs)
 	data.Error = types.StringPointerValue(changefeed.Error)
+}
+
+// keepPlannedChangefeedComputedFields restores the computed fields that the
+// update plan already set from the prior state. Terraform rejects an apply
+// whose result differs from a known planned value, and the checkpoint moves
+// on while the changefeed replicates; the next refresh reads the live values.
+func keepPlannedChangefeedComputedFields(planned, data *dedicatedChangefeedResourceData) {
+	for _, f := range []struct{ planned, data *types.String }{
+		{&planned.State, &data.State},
+		{&planned.CreateTime, &data.CreateTime},
+		{&planned.CheckpointTso, &data.CheckpointTso},
+		{&planned.CheckpointTs, &data.CheckpointTs},
+		{&planned.Error, &data.Error},
+	} {
+		if !f.planned.IsUnknown() {
+			*f.data = *f.planned
+		}
+	}
+}
+
+// changefeedStateUnlessPausedChanges plans state as its prior value unless the
+// update changes paused, the only change that moves the changefeed to another
+// steady state: Update restores the pause state around a downstream edit.
+// With paused unset in the configuration, Terraform does not change it.
+type changefeedStateUnlessPausedChanges struct{}
+
+func (m changefeedStateUnlessPausedChanges) Description(_ context.Context) string {
+	return "Keeps the prior state unless the update changes paused."
+}
+
+func (m changefeedStateUnlessPausedChanges) MarkdownDescription(ctx context.Context) string {
+	return m.Description(ctx)
+}
+
+func (m changefeedStateUnlessPausedChanges) PlanModifyString(ctx context.Context, req planmodifier.StringRequest, resp *planmodifier.StringResponse) {
+	if req.State.Raw.IsNull() || !req.PlanValue.IsUnknown() {
+		return
+	}
+	var configPaused, statePaused types.Bool
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("paused"), &configPaused)...)
+	resp.Diagnostics.Append(req.State.GetAttribute(ctx, path.Root("paused"), &statePaused)...)
+	if resp.Diagnostics.HasError() || configPaused.IsUnknown() {
+		return
+	}
+	if !configPaused.IsNull() && !configPaused.Equal(statePaused) {
+		return
+	}
+	resp.PlanValue = req.StateValue
 }
 
 // refreshDedicatedChangefeedResourceData copies the API changefeed onto the

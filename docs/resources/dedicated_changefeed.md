@@ -112,11 +112,11 @@ resource "tidbcloud_dedicated_changefeed" "mysql_example" {
 ### Read-Only
 
 - `changefeed_id` (String) The ID of the changefeed.
-- `checkpoint_ts` (String) The checkpoint timestamp of the changefeed.
-- `checkpoint_tso` (String) The checkpoint TSO of the changefeed.
+- `checkpoint_ts` (String) The checkpoint timestamp of the changefeed, as of the last refresh.
+- `checkpoint_tso` (String) The checkpoint TSO of the changefeed, as of the last refresh.
 - `create_time` (String) The creation time of the changefeed.
-- `error` (String) The error message when the changefeed is in the `FAILED` or `ERROR` state.
-- `state` (String) The current state of the changefeed.
+- `error` (String) The error message when the changefeed is in the `FAILED` or `ERROR` state, as of the last refresh.
+- `state` (String) The current state of the changefeed, as of the last refresh. An update that does not change `paused` keeps the refreshed value until the next refresh.
 
 <a id="nestedatt--network_info"></a>
 ### Nested Schema for `network_info`

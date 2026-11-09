@@ -10,8 +10,10 @@ import (
 
 	"github.com/golang/mock/gomock"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/knownvalue"
 	"github.com/hashicorp/terraform-plugin-testing/plancheck"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
+	"github.com/hashicorp/terraform-plugin-testing/tfjsonpath"
 	mockClient "github.com/tidbcloud/terraform-provider-tidbcloud/mock"
 	"github.com/tidbcloud/terraform-provider-tidbcloud/tidbcloud"
 )
@@ -30,11 +32,15 @@ type changefeedStore struct {
 	// failGet makes GetChangefeed return an error, for exercising the
 	// create-succeeded-but-read-failed path.
 	failGet bool
+	// advanceCheckpoint moves the checkpoint on every GetChangefeed, as a
+	// replicating changefeed does.
+	advanceCheckpoint bool
 	// call counters, for asserting that an operation was skipped
 	pauseCalls  int
 	resumeCalls int
 	deleteCalls int
 	scaleCalls  int
+	checkpoints int
 }
 
 func (s *changefeedStore) get() *tidbcloud.Changefeed {
@@ -69,6 +75,10 @@ func newChangefeedMock(t *testing.T) (*mockClient.MockTiDBCloudDedicatedClient, 
 			}
 			if store.deleted {
 				return nil, &tidbcloud.ChangefeedAPIError{StatusCode: http.StatusNotFound}
+			}
+			if store.advanceCheckpoint {
+				store.checkpoints++
+				store.changefeed.CheckpointTso = Ptr(fmt.Sprintf("%d", store.checkpoints))
 			}
 			return store.get(), nil
 		}).AnyTimes()
@@ -515,6 +525,76 @@ func TestUTDedicatedChangefeedResourcePausedDrift(t *testing.T) {
 						}
 						return nil
 					},
+				),
+			},
+		},
+	})
+}
+
+// TestUTDedicatedChangefeedResourceComputedFieldsKnownOnUpdate checks that an
+// update plan keeps the refreshed computed attributes instead of showing them
+// as "(known after apply)", while the checkpoint keeps moving: the apply must
+// not report an inconsistent result. Only a change of paused leaves state
+// unknown.
+func TestUTDedicatedChangefeedResourceComputedFieldsKnownOnUpdate(t *testing.T) {
+	setupTestEnv()
+
+	s, store := newChangefeedMock(t)
+	defer HookGlobal(&NewDedicatedClient, func(publicKey string, privateKey string, dedicatedEndpoint string, userAgent string) (tidbcloud.TiDBCloudDedicatedClient, error) {
+		return s, nil
+	})()
+	store.advanceCheckpoint = true
+
+	changefeedResourceName := "tidbcloud_dedicated_changefeed.test"
+	knownComputed := func(attrs ...string) []plancheck.PlanCheck {
+		var checks []plancheck.PlanCheck
+		for _, a := range attrs {
+			checks = append(checks, plancheck.ExpectKnownValue(changefeedResourceName, tfjsonpath.New(a), knownvalue.NotNull()))
+		}
+		return append(checks, plancheck.ExpectKnownValue(changefeedResourceName, tfjsonpath.New("error"), knownvalue.Null()))
+	}
+	resource.Test(t, resource.TestCase{
+		IsUnitTest:               true,
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: testUTDedicatedChangefeedResourceConfig("4rcu", "tidb-cdc", ""),
+			},
+			// Edit the downstream config with paused unset: the feed is
+			// paused for the edit and resumed, and no computed attribute is
+			// unknown in the plan.
+			{
+				Config: testUTDedicatedChangefeedResourceConfig("4rcu", "tidb-cdc-v2", ""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: append(knownComputed("state", "create_time", "checkpoint_tso", "checkpoint_ts"),
+						plancheck.ExpectResourceAction(changefeedResourceName, plancheck.ResourceActionUpdate)),
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(changefeedResourceName, "kafka.topic_partition_config.default_topic", "tidb-cdc-v2"),
+					resource.TestCheckResourceAttr(changefeedResourceName, "state", "RUNNING"),
+				),
+			},
+			// Pausing changes state, so only state is unknown.
+			{
+				Config: testUTDedicatedChangefeedResourceConfig("4rcu", "tidb-cdc-v2", "paused = true"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: append(knownComputed("create_time", "checkpoint_tso", "checkpoint_ts"),
+						plancheck.ExpectUnknownValue(changefeedResourceName, tfjsonpath.New("state"))),
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(changefeedResourceName, "state", "PAUSED"),
+				),
+			},
+			// Editing with paused set and unchanged keeps state known.
+			{
+				Config: testUTDedicatedChangefeedResourceConfig("4rcu", "tidb-cdc-v3", "paused = true"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: knownComputed("state", "create_time", "checkpoint_tso", "checkpoint_ts"),
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(changefeedResourceName, "kafka.topic_partition_config.default_topic", "tidb-cdc-v3"),
+					resource.TestCheckResourceAttr(changefeedResourceName, "state", "PAUSED"),
 				),
 			},
 		},
