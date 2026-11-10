@@ -123,6 +123,9 @@ func (r *clusterResource) Configure(_ context.Context, req resource.ConfigureReq
 func (r *clusterResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
 		MarkdownDescription: "cluster resource(deprecated). Use serverless_cluster and dedicated_cluster resources instead for more comprehensive functions",
+		DeprecationMessage: "tidbcloud_cluster is deprecated. This resource cannot detect IP access list changes made outside Terraform or update the IP access list of an existing cluster. " +
+			"Migrate to tidbcloud_dedicated_cluster or tidbcloud_serverless_cluster. " +
+			"See https://docs.pingcap.com/tidbcloud/terraform-migrate-cluster-resource/ for migration instructions.",
 		Attributes: map[string]schema.Attribute{
 			"project_id": schema.StringAttribute{
 				MarkdownDescription: "The ID of the project. You can get the project ID from [tidbcloud_projects datasource](../data-sources/projects.md).",
@@ -245,8 +248,9 @@ func (r *clusterResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 				Required:            true,
 				Attributes: map[string]schema.Attribute{
 					"root_password": schema.StringAttribute{
-						MarkdownDescription: "The root password to access the cluster. It must be 8-64 characters.",
+						MarkdownDescription: "The root password to access the cluster. It must be 8-64 characters and is required when creating a cluster. Password updates are not supported by this deprecated resource. Omit this attribute for imported clusters. Removing this attribute leaves the remote password unchanged.",
 						Optional:            true,
+						Sensitive:           true,
 					},
 					"port": schema.Int64Attribute{
 						MarkdownDescription: "The TiDB port for connection. The port must be in the range of 1024-65535 except 10080, 4000 in default.\n" +
@@ -406,6 +410,11 @@ func (r clusterResource) Create(ctx context.Context, req resource.CreateRequest,
 	diags := req.Config.Get(ctx, &data)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	if err := validateRootPassword(data.Config.RootPassword, true); err != nil {
+		resp.Diagnostics.AddAttributeError(path.Root("config").AtName("root_password"), "Invalid root password", err.Error())
 		return
 	}
 
@@ -657,6 +666,17 @@ func (r clusterResource) Update(ctx context.Context, req resource.UpdateRequest,
 		return
 	}
 
+	// The legacy API cannot rotate a password. Removing it from configuration
+	// only stops tracking the secret and does not change the remote credential.
+	if !data.Config.RootPassword.IsNull() && !data.Config.RootPassword.Equal(state.Config.RootPassword) {
+		resp.Diagnostics.AddAttributeError(
+			path.Root("config").AtName("root_password"),
+			"Unsupported password update",
+			"root_password cannot be updated by tidbcloud_cluster. Rotate the password in the TiDB Cloud console, or use tidbcloud_dedicated_cluster to manage supported dedicated clusters.",
+		)
+		return
+	}
+
 	// Severless can not be changed now
 	if data.ClusterType == dev {
 		resp.Diagnostics.AddError(
@@ -811,12 +831,14 @@ func (r clusterResource) Update(ctx context.Context, req resource.UpdateRequest,
 		}
 	}
 
-	tflog.Trace(ctx, "update cluster_resource")
-	updateClusterParams := clusterApi.NewUpdateClusterParams().WithProjectID(data.ProjectId).WithClusterID(data.ClusterId.ValueString()).WithBody(updateClusterBody)
-	_, err := r.provider.client.UpdateCluster(updateClusterParams)
-	if err != nil {
-		resp.Diagnostics.AddError("Update Error", fmt.Sprintf("Unable to call UpdateClusterById, got error: %s", err))
-		return
+	if updateClusterBody.Config.Components != nil || updateClusterBody.Config.Paused != nil {
+		tflog.Trace(ctx, "update cluster_resource")
+		updateClusterParams := clusterApi.NewUpdateClusterParams().WithProjectID(data.ProjectId).WithClusterID(data.ClusterId.ValueString()).WithBody(updateClusterBody)
+		_, err := r.provider.client.UpdateCluster(updateClusterParams)
+		if err != nil {
+			resp.Diagnostics.AddError("Update Error", fmt.Sprintf("Unable to call UpdateClusterById, got error: %s", err))
+			return
+		}
 	}
 
 	if r.provider.sync {

@@ -3,7 +3,6 @@ package tidbcloud
 import (
 	"fmt"
 	"net/http"
-	"net/url"
 	"os"
 
 	"github.com/c4pt0r/go-tidbcloud-sdk-v1/client/backup"
@@ -159,13 +158,17 @@ func (d *ClientDelegate) GenerateUploadURL(params *importService.GenerateUploadU
 }
 
 func (d *ClientDelegate) PreSignedUrlUpload(url *string, uploadFile *os.File, size int64) error {
+	if _, err := validateApiUrl(*url); err != nil {
+		return fmt.Errorf("invalid upload URL: %w", err)
+	}
+
 	request, err := http.NewRequest("PUT", *url, uploadFile)
 	if err != nil {
 		return err
 	}
 	request.ContentLength = size
 
-	putRes, err := http.DefaultClient.Do(request)
+	putRes, err := newHTTPSClient(nil).Do(request)
 	if err != nil {
 		return err
 	}
@@ -179,18 +182,14 @@ func (d *ClientDelegate) PreSignedUrlUpload(url *string, uploadFile *os.File, si
 }
 
 func NewApiClient(publicKey string, privateKey string, apiUrl string, userAgent string) (*apiClient.GoTidbcloud, *importClient.GoTidbcloudImport, error) {
-	httpclient := &http.Client{
-		Transport: NewTransportWithAgent(&digest.Transport{
-			Username: publicKey,
-			Password: privateKey,
-		}, userAgent),
-	}
-
-	// Parse the URL
-	u, err := url.ParseRequestURI(apiUrl)
+	u, err := validateApiUrl(apiUrl)
 	if err != nil {
 		return nil, nil, err
 	}
+	httpclient := newAPIHTTPClient(NewTransportWithAgent(&digest.Transport{
+		Username: publicKey,
+		Password: privateKey,
+	}, userAgent))
 
 	transport := httpTransport.NewWithClient(u.Host, u.Path, []string{u.Scheme}, httpclient)
 	return apiClient.New(transport, strfmt.Default), importClient.New(transport, strfmt.Default), nil
