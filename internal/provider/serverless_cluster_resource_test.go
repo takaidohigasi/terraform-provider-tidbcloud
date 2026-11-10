@@ -1,10 +1,13 @@
 package provider
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
 	"github.com/golang/mock/gomock"
+	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	mockClient "github.com/tidbcloud/terraform-provider-tidbcloud/mock"
 	"github.com/tidbcloud/terraform-provider-tidbcloud/tidbcloud"
@@ -87,6 +90,9 @@ func testServerlessClusterResource(t *testing.T) {
 					resource.TestCheckResourceAttrSet(serverlessClusterResourceName, "cluster_id"),
 					resource.TestCheckResourceAttr(serverlessClusterResourceName, "display_name", "test-tf"),
 					resource.TestCheckResourceAttr(serverlessClusterResourceName, "region.name", "regions/aws-us-east-1"),
+					resource.TestCheckResourceAttr(serverlessClusterResourceName, "spending_limit.monthly", "0"),
+					resource.TestCheckNoResourceAttr(serverlessClusterResourceName, "auto_scaling.min_rcu"),
+					resource.TestCheckNoResourceAttr(serverlessClusterResourceName, "auto_scaling.max_rcu"),
 				),
 			},
 			// // Update correctly
@@ -100,6 +106,100 @@ func testServerlessClusterResource(t *testing.T) {
 			// Delete testing automatically occurs in TestCase
 		},
 	})
+}
+
+func TestRefreshServerlessClusterResourceDataNormalizesZeroAutoScaling(t *testing.T) {
+	clusterId := "cluster_id"
+	regionName := "regions/aws-us-east-1"
+	displayName := "test-tf"
+
+	getClusterResp := clusterV1beta1.TidbCloudOpenApiserverlessv1beta1Cluster{}
+	err := getClusterResp.UnmarshalJSON([]byte(testUTTidbCloudOpenApiserverlessv1beta1Cluster(clusterId, regionName, displayName, string(clusterV1beta1.COMMONV1BETA1CLUSTERSTATE_ACTIVE))))
+	if err != nil {
+		t.Fatalf("failed to unmarshal cluster fixture: %v", err)
+	}
+
+	var data serverlessClusterResourceData
+	err = refreshServerlessClusterResourceData(context.Background(), &getClusterResp, &data)
+	if err != nil {
+		t.Fatalf("failed to refresh serverless cluster data: %v", err)
+	}
+	if !data.AutoScaling.IsNull() {
+		t.Fatalf("expected zero auto scaling response to be normalized to null, got %#v", data.AutoScaling)
+	}
+}
+
+func TestRefreshServerlessClusterResourceDataPreservesExplicitZeroAutoScaling(t *testing.T) {
+	clusterId := "cluster_id"
+	regionName := "regions/aws-us-east-1"
+	displayName := "test-tf"
+
+	getClusterResp := clusterV1beta1.TidbCloudOpenApiserverlessv1beta1Cluster{}
+	err := getClusterResp.UnmarshalJSON([]byte(testUTTidbCloudOpenApiserverlessv1beta1Cluster(clusterId, regionName, displayName, string(clusterV1beta1.COMMONV1BETA1CLUSTERSTATE_ACTIVE))))
+	if err != nil {
+		t.Fatalf("failed to unmarshal cluster fixture: %v", err)
+	}
+
+	ctx := context.Background()
+	data := serverlessClusterResourceData{
+		AutoScaling: mustAutoScalingObject(t, ctx, 0, 0),
+	}
+
+	err = refreshServerlessClusterResourceData(ctx, &getClusterResp, &data)
+	if err != nil {
+		t.Fatalf("failed to refresh serverless cluster data: %v", err)
+	}
+	if data.AutoScaling.IsNull() {
+		t.Fatal("expected explicit zero auto scaling to be preserved")
+	}
+
+	var refreshed autoScaling
+	diags := data.AutoScaling.As(ctx, &refreshed, basetypes.ObjectAsOptions{})
+	if diags.HasError() {
+		t.Fatalf("failed to decode refreshed auto scaling: %v", diags)
+	}
+	if refreshed.MinRCU.ValueInt64() != 0 || refreshed.MaxRCU.ValueInt64() != 0 {
+		t.Fatalf("expected zero auto scaling, got min=%d max=%d", refreshed.MinRCU.ValueInt64(), refreshed.MaxRCU.ValueInt64())
+	}
+}
+
+func TestRefreshServerlessClusterResourceDataPreservesPlannedZeroAutoScaling(t *testing.T) {
+	clusterId := "cluster_id"
+	regionName := "regions/aws-us-east-1"
+	displayName := "test-tf"
+
+	getClusterResp := clusterV1beta1.TidbCloudOpenApiserverlessv1beta1Cluster{}
+	err := getClusterResp.UnmarshalJSON([]byte(testUTTidbCloudOpenApiserverlessv1beta1Cluster(clusterId, regionName, displayName, string(clusterV1beta1.COMMONV1BETA1CLUSTERSTATE_ACTIVE))))
+	if err != nil {
+		t.Fatalf("failed to unmarshal cluster fixture: %v", err)
+	}
+
+	ctx := context.Background()
+	plan := serverlessClusterResourceData{
+		AutoScaling: mustAutoScalingObject(t, ctx, 0, 0),
+	}
+
+	err = refreshServerlessClusterResourceData(ctx, &getClusterResp, &plan)
+	if err != nil {
+		t.Fatalf("failed to refresh serverless cluster data: %v", err)
+	}
+	if plan.AutoScaling.IsNull() {
+		t.Fatal("expected planned zero auto scaling to be preserved")
+	}
+}
+
+func mustAutoScalingObject(t *testing.T, ctx context.Context, minRCU, maxRCU int64) types.Object {
+	t.Helper()
+
+	as := autoScaling{
+		MinRCU: types.Int64Value(minRCU),
+		MaxRCU: types.Int64Value(maxRCU),
+	}
+	value, diags := types.ObjectValueFrom(ctx, autoScalingAttrTypes, as)
+	if diags.HasError() {
+		t.Fatalf("failed to build auto scaling object: %v", diags)
+	}
+	return value
 }
 
 func testAccServerlessClusterResourceConfig() string {
@@ -160,6 +260,10 @@ func testUTTidbCloudOpenApiserverlessv1beta1Cluster(clusterId, regionName, displ
     },
     "spendingLimit": {
         "monthly": 0
+    },
+    "autoScaling": {
+        "minRcu": 0,
+        "maxRcu": 0
     },
     "automatedBackupPolicy": {
         "startTime": "07:00",

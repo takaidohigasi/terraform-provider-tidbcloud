@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/attr"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -451,12 +452,12 @@ func (r serverlessClusterResource) Create(ctx context.Context, req resource.Crea
 
 func (r serverlessClusterResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
 	// get data from state
-	var clusterId string
-
-	resp.Diagnostics.Append(req.State.GetAttribute(ctx, path.Root("cluster_id"), &clusterId)...)
+	var data serverlessClusterResourceData
+	resp.Diagnostics.Append(req.State.Get(ctx, &data)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	clusterId := data.ClusterId.ValueString()
 	tflog.Debug(ctx, fmt.Sprintf("read serverless_cluster_resource cluster_id: %s", clusterId))
 
 	// call read api
@@ -466,7 +467,6 @@ func (r serverlessClusterResource) Read(ctx context.Context, req resource.ReadRe
 		tflog.Error(ctx, fmt.Sprintf("Unable to call GetCluster, error: %s", err))
 		return
 	}
-	var data serverlessClusterResourceData
 	err = refreshServerlessClusterResourceData(ctx, cluster, &data)
 	if err != nil {
 		resp.Diagnostics.AddError("Refresh Error", fmt.Sprintf("Unable to refresh serverless cluster resource data, got error: %s", err))
@@ -543,12 +543,17 @@ func (r serverlessClusterResource) Update(ctx context.Context, req resource.Upda
 	}
 
 	if IsKnown(plan.SpendingLimit) {
-		if IsKnown(plan.AutoScaling) || IsKnown(state.AutoScaling) {
+		stateHasAutoScaling, diags := hasEffectiveAutoScaling(ctx, state.AutoScaling)
+		resp.Diagnostics.Append(diags...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		if IsKnown(plan.AutoScaling) || stateHasAutoScaling {
 			resp.Diagnostics.AddError("Update Error", "Cannot set both spending limit and capacity for serverless cluster")
 			return
 		}
 		var planLimit spendingLimit
-		diags := plan.SpendingLimit.As(ctx, &planLimit, basetypes.ObjectAsOptions{})
+		diags = plan.SpendingLimit.As(ctx, &planLimit, basetypes.ObjectAsOptions{})
 		if diags.HasError() {
 			resp.Diagnostics.Append(diags...)
 			return
@@ -642,14 +647,14 @@ func (r serverlessClusterResource) Update(ctx context.Context, req resource.Upda
 		tflog.Error(ctx, fmt.Sprintf("Unable to call GetCluster, error: %s", err))
 		return
 	}
-	err = refreshServerlessClusterResourceData(ctx, cluster, &state)
+	err = refreshServerlessClusterResourceData(ctx, cluster, &plan)
 	if err != nil {
 		resp.Diagnostics.AddError("Refresh Error", fmt.Sprintf("Unable to refresh serverless cluster resource data, got error: %s", err))
 		return
 	}
 
 	// save into the Terraform state.
-	diags = resp.State.Set(ctx, &state)
+	diags = resp.State.Set(ctx, &plan)
 	resp.Diagnostics.Append(diags...)
 }
 
@@ -764,7 +769,7 @@ func refreshServerlessClusterResourceData(ctx context.Context, resp *clusterV1be
 		data.SpendingLimit = types.ObjectNull(spendingLimitAttrTypes)
 	}
 
-	if resp.AutoScaling != nil {
+	if hasAPIAutoScaling(resp.AutoScaling) || (resp.AutoScaling != nil && IsKnown(data.AutoScaling)) {
 		as := autoScaling{
 			MinRCU: types.Int64Value(*resp.AutoScaling.MinRcu),
 			MaxRCU: types.Int64Value(*resp.AutoScaling.MaxRcu),
@@ -823,6 +828,31 @@ func refreshServerlessClusterResourceData(ctx context.Context, resp *clusterV1be
 	data.Labels = labels
 	data.Annotations = annotations
 	return nil
+}
+
+func hasEffectiveAutoScaling(ctx context.Context, value types.Object) (bool, diag.Diagnostics) {
+	var diags diag.Diagnostics
+	if !IsKnown(value) {
+		return false, diags
+	}
+
+	var as autoScaling
+	diags = value.As(ctx, &as, basetypes.ObjectAsOptions{})
+	if diags.HasError() {
+		return false, diags
+	}
+	return !isZeroAutoScaling(as.MinRCU.ValueInt64(), as.MaxRCU.ValueInt64()), diags
+}
+
+func hasAPIAutoScaling(as *clusterV1beta1.V1beta1ClusterAutoScaling) bool {
+	if as == nil || as.MinRcu == nil || as.MaxRcu == nil {
+		return false
+	}
+	return !isZeroAutoScaling(*as.MinRcu, *as.MaxRcu)
+}
+
+func isZeroAutoScaling(minRCU, maxRCU int64) bool {
+	return minRCU == 0 && maxRCU == 0
 }
 
 func WaitServerlessClusterReady(ctx context.Context, timeout time.Duration, interval time.Duration, clusterId string,
